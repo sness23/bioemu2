@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BioEmu2 Flythrough</title>
+<style>
+  :root { --hud: #7f7; --dim: #3a6b3a; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  .hud { position: fixed; pointer-events: none; font: 13px/1.4 ui-monospace, monospace; color: var(--hud); }
+  #crosshair { left: 50%; top: 50%; transform: translate(-50%, -50%); font-size: 20px; }
+  #status { left: 12px; bottom: 10px; }
+  #speed { right: 12px; bottom: 10px; text-align: right; }
+  #help { left: 12px; top: 10px; white-space: pre; color: var(--dim); }
+  #start { inset: 0; display: flex; align-items: center; justify-content: center;
+           font-size: 16px; background: rgba(0,0,0,.3); pointer-events: auto; cursor: pointer; }
+  #start.hidden { display: none; }
+</style>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+</head>
+<body>
+<div id="crosshair" class="hud">+</div>
+<div id="status" class="hud"></div>
+<div id="speed" class="hud"></div>
+<div id="help" class="hud">mouse   pitch / yaw        W S  thrust      A D  slide
+Q E     roll               R F  up / down   shift  boost
+space   play / pause       , .  step frame  [ ]  playback rate
+- =     fog distance       T  next trajectory  C  recentre
+H       hide this help     Esc  release mouse</div>
+<div id="start" class="hud">click to fly</div>
+<script type="module">
+import * as THREE from "three";
+
+// Jmol-style CPK colours; anything else is magenta.
+const CPK = { H: 0xffffff, C: 0xc8c8c8, N: 0x3050f8, O: 0xff0d0d, S: 0xffff30, P: 0xff8000,
+              F: 0x90e050, Cl: 0x1ff01f, Br: 0xa62929, I: 0x940094, Fe: 0xe06633,
+              Zn: 0x7d80b0, Mg: 0x8aff00, Ca: 0x3dff00, Na: 0xab5cf2, K: 0x8f40d4 };
+
+// Flight model, in seconds; thrust is in molecule radii per s² so small and large systems feel the same.
+const THRUST = 0.8, DRAG = 0.6, BOOST = 3;
+const MOUSE_TURN = 0.06, KEY_TURN = 4, ROLL = 3, TURN_DAMPING = 8;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.Fog(0x000000, 0, 100);  // near and far are reset per trajectory
+const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 5000);
+
+const velocity = new THREE.Vector3();
+const spin = new THREE.Vector3();  // local pitch, yaw, roll rates
+const keys = new Set();
+
+let traj = null, lines = null, atomPos = null, radius = 20;
+let trajNames = [], trajIndex = 0;
+let simFrame = 0, playing = true, framesPerSecond = 4;
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+resize();
+
+async function loadTrajectory(index) {
+  const meta = await (await fetch(`/api/traj/${index}/meta`)).json();
+  const coords = new Float32Array(await (await fetch(`/api/traj/${index}/coords`)).arrayBuffer());
+  traj = { ...meta, coords };
+  atomPos = new Float32Array(meta.n_atoms * 3);
+
+  // Each bond is two segments, atom -> midpoint -> atom, each coloured by its own atom.
+  const nBonds = meta.bonds.length / 2;
+  const colors = new Float32Array(nBonds * 12);
+  const color = new THREE.Color();
+  for (let b = 0; b < nBonds; b++) {
+    for (let side = 0; side < 2; side++) {
+      color.setHex(CPK[meta.elements[meta.bonds[2 * b + side]]] ?? 0xff00ff);
+      for (let v = 0; v < 2; v++) color.toArray(colors, b * 12 + side * 6 + v * 3);
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(nBonds * 12), 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  if (lines) { scene.remove(lines); lines.geometry.dispose(); }
+  lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ vertexColors: true }));
+  lines.frustumCulled = false;
+  scene.add(lines);
+
+  radius = 0;
+  for (let i = 0; i < meta.n_atoms * 3; i += 3)
+    radius = Math.max(radius, Math.hypot(coords[i], coords[i + 1], coords[i + 2]));
+  scene.fog.near = radius * 0.5;
+  scene.fog.far = radius * 4;
+  simFrame = 0;
+  recentre();
+}
+
+function recentre() {
+  camera.position.set(0, 0, radius * 1.6);
+  camera.quaternion.identity();
+  velocity.set(0, 0, 0);
+  spin.set(0, 0, 0);
+}
+
+// Catmull-Rom through neighbouring frames so playback reads as continuous motion.
+function interpolateAtoms(t) {
+  const n = traj.n_frames, stride = traj.n_atoms * 3, c = traj.coords;
+  const i1 = Math.floor(t), u = t - i1;
+  const i0 = Math.max(i1 - 1, 0), i2 = Math.min(i1 + 1, n - 1), i3 = Math.min(i1 + 2, n - 1);
+  const u2 = u * u, u3 = u2 * u;
+  const w0 = -0.5 * u3 + u2 - 0.5 * u, w1 = 1.5 * u3 - 2.5 * u2 + 1;
+  const w2 = -1.5 * u3 + 2 * u2 + 0.5 * u, w3 = 0.5 * u3 - 0.5 * u2;
+  const o0 = i0 * stride, o1 = i1 * stride, o2 = i2 * stride, o3 = i3 * stride;
+  for (let k = 0; k < stride; k++)
+    atomPos[k] = w0 * c[o0 + k] + w1 * c[o1 + k] + w2 * c[o2 + k] + w3 * c[o3 + k];
+}
+
+function updateBonds() {
+  const pos = lines.geometry.attributes.position.array, bonds = traj.bonds;
+  for (let b = 0, o = 0; b < bonds.length; b += 2, o += 12) {
+    const a = bonds[b] * 3, z = bonds[b + 1] * 3;
+    for (let k = 0; k < 3; k++) {
+      const pa = atomPos[a + k], pz = atomPos[z + k], mid = 0.5 * (pa + pz);
+      pos[o + k] = pa; pos[o + 3 + k] = mid; pos[o + 6 + k] = mid; pos[o + 9 + k] = pz;
+    }
+  }
+  lines.geometry.attributes.position.needsUpdate = true;
+}
+
+const axis = (pos, neg) => (keys.has(pos) ? 1 : 0) - (keys.has(neg) ? 1 : 0);
+const rotation = new THREE.Quaternion(), euler = new THREE.Euler();
+const thrust = new THREE.Vector3();
+
+function fly(dt) {
+  thrust.set(axis("KeyD", "KeyA"), axis("KeyR", "KeyF"), axis("KeyS", "KeyW"));
+  if (thrust.lengthSq() > 0) {
+    thrust.normalize().multiplyScalar(THRUST * radius * (keys.has("ShiftLeft") || keys.has("ShiftRight") ? BOOST : 1));
+    velocity.addScaledVector(thrust.applyQuaternion(camera.quaternion), dt);
+  }
+  velocity.multiplyScalar(Math.exp(-DRAG * dt));
+  camera.position.addScaledVector(velocity, dt);
+
+  spin.x += axis("ArrowUp", "ArrowDown") * KEY_TURN * dt;
+  spin.y += axis("ArrowLeft", "ArrowRight") * KEY_TURN * dt;
+  spin.z += axis("KeyQ", "KeyE") * ROLL * dt;
+  spin.multiplyScalar(Math.exp(-TURN_DAMPING * dt));
+  rotation.setFromEuler(euler.set(spin.x * dt, spin.y * dt, spin.z * dt));
+  camera.quaternion.multiply(rotation).normalize();
+}
+
+function updateHud() {
+  const i = Math.min(Math.round(simFrame), traj.n_frames - 1);
+  const ns = traj.times_ps[i] / 1000;
+  document.getElementById("status").textContent =
+    `${traj.name}   t = ${ns.toFixed(1)} ns   frame ${i + 1}/${traj.n_frames}   ` +
+    `${playing ? "▶" : "❚❚"} ${framesPerSecond} fr/s`;
+  document.getElementById("speed").textContent = `speed ${velocity.length().toFixed(1)} Å/s`;
+}
+
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (traj) {
+    if (playing && traj.n_frames > 1) simFrame = (simFrame + framesPerSecond * dt) % (traj.n_frames - 1);
+    fly(dt);
+    interpolateAtoms(simFrame);
+    updateBonds();
+    updateHud();
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+const start = document.getElementById("start");
+start.addEventListener("click", () => renderer.domElement.requestPointerLock());
+document.addEventListener("pointerlockchange", () => {
+  start.classList.toggle("hidden", document.pointerLockElement === renderer.domElement);
+});
+document.addEventListener("mousemove", (e) => {
+  if (document.pointerLockElement !== renderer.domElement) return;
+  spin.y -= e.movementX * MOUSE_TURN;
+  spin.x -= e.movementY * MOUSE_TURN;
+});
+document.addEventListener("keyup", (e) => keys.delete(e.code));
+document.addEventListener("keydown", (e) => {
+  keys.add(e.code);
+  if (!traj) return;
+  const last = traj.n_frames - 1;
+  switch (e.code) {
+    case "Space": playing = !playing; e.preventDefault(); break;
+    case "Comma": playing = false; simFrame = Math.max(Math.round(simFrame) - 1, 0); break;
+    case "Period": playing = false; simFrame = Math.min(Math.round(simFrame) + 1, last); break;
+    case "BracketLeft": framesPerSecond = Math.max(framesPerSecond / 2, 0.25); break;
+    case "BracketRight": framesPerSecond = Math.min(framesPerSecond * 2, 64); break;
+    case "Minus": scene.fog.far = Math.max(scene.fog.far / 1.25, 5); break;
+    case "Equal": scene.fog.far *= 1.25; break;
+    case "KeyC": recentre(); break;
+    case "KeyH": document.getElementById("help").hidden ^= true; break;
+    case "KeyT": trajIndex = (trajIndex + 1) % trajNames.length; loadTrajectory(trajIndex); break;
+  }
+});
+window.addEventListener("blur", () => keys.clear());
+
+trajNames = await (await fetch("/api/list")).json();
+await loadTrajectory(0);
+frame();
+</script>
+</body>
+</html>
